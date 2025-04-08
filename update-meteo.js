@@ -1,3 +1,15 @@
+// Au début du script, ajoutez ce code de débogage
+console.log("=== VARIABLES D'ENVIRONNEMENT DISPONIBLES ===");
+console.log("SUPABASE_URL existe:", process.env.SUPABASE_URL ? "OUI" : "NON");
+console.log("SUPABASE_SERVICE_ROLE_KEY existe:", process.env.SUPABASE_SERVICE_ROLE_KEY ? "OUI" : "NON");
+console.log("SUPABASE_KEY existe:", process.env.SUPABASE_KEY ? "OUI" : "NON");
+
+// Liste toutes les variables d'environnement disponibles (sans leurs valeurs)
+console.log("Toutes les variables d'environnement disponibles:");
+Object.keys(process.env).forEach(key => {
+  console.log(`- ${key}`);
+});
+
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 
