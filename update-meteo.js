@@ -9,7 +9,7 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!supabaseUrl || !supabaseKey) {
   console.error("Variables d'environnement manquantes");
   console.error("SUPABASE_URL:", supabaseUrl ? "Définie" : "Non définie");
-  console.error("SUPABASE_KEY:", supabaseKey ? "Définie" : "Non définie");
+  console.error("SUPABASE_SERVICE_ROLE_KEY:", supabaseKey ? "Définie" : "Non définie");
   process.exit(1);
 }
 
