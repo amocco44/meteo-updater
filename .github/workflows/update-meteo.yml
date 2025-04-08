@@ -20,8 +20,8 @@ jobs:
       - name: Install dependencies
         run: npm install
         
-- name: Update METAR and TAF data
-        run: node update-meteo.js
+- name: Test Environment Variables
+        run: node test-env.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
