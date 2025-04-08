@@ -1,27 +1,2 @@
-name: Update METAR and TAF data
-
-on:
-  schedule:
-    - cron: '*/2 * * * *'  # Toutes les 2 minutes
-  workflow_dispatch:        # Permet de déclencher manuellement
-
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-        
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-          
-      - name: Install dependencies
-        run: npm install @supabase/supabase-js node-fetch
-        
-      - name: Update METAR and TAF data
-        run: node update-meteo.js
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+- name: Install dependencies
+  run: npm install
