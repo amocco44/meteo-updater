@@ -1,8 +1,6 @@
 {
   "name": "meteo-updater",
   "version": "1.0.0",
-  "description": "Update METAR and TAF data",
-  "main": "update-meteo.js",
   "type": "module",
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
