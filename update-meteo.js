@@ -5,61 +5,155 @@ import fetch from 'node-fetch';
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Vérifier que les variables d'environnement sont définies
 if (!supabaseUrl || !supabaseKey) {
   console.error("Variables d'environnement manquantes");
-  console.error("SUPABASE_URL:", supabaseUrl ? "Définie" : "Non définie");
-  console.error("SUPABASE_SERVICE_ROLE_KEY:", supabaseKey ? "Définie" : "Non définie");
   process.exit(1);
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Paramètres de performance
-const CONCURRENT_BATCH_SIZE = 10; // Réduit à 10 pour éviter les surcharges
-const INITIAL_BATCH_SIZE = 5;     // Premier lot encore plus petit
-const RETRY_ATTEMPTS = 5;         // Augmenté à 5 pour plus de réessais
-const RETRY_DELAY = 1000;         // Délai initial de 1 seconde
-const MAX_RETRY_DELAY = 10000;    // Délai maximum de 10 secondes
+// Paramètres
+const BATCH_SIZE = 5; // Petits lots pour éviter les timeouts
+const PAUSE_BETWEEN_AERODROMES = 300; // ms
+const PAUSE_BETWEEN_LOTS = 2000; // ms
 
-// Fonction avec retry pour les appels HTTP
-async function fetchWithRetry(url, retries = RETRY_ATTEMPTS, delay = RETRY_DELAY) {
-  try {
-    const response = await fetch(url);
-    return response;
-  } catch (error) {
-    if (retries <= 1) throw error;
-    console.log(`Réessai de récupération de ${url} dans ${delay/1000}s...`);
-    await new Promise(resolve => setTimeout(resolve, delay));
-    return fetchWithRetry(url, retries - 1, Math.min(delay * 2, MAX_RETRY_DELAY));
-  }
-}
-
-// Fonction pour effectuer des opérations Supabase avec retry
-async function supabaseWithRetry(operation, retries = RETRY_ATTEMPTS, delay = RETRY_DELAY) {
-  try {
-    return await operation();
-  } catch (error) {
-    if (error.message && error.message.includes('timeout') && retries > 1) {
-      console.log(`Timeout Supabase, réessai dans ${delay/1000}s...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return supabaseWithRetry(operation, retries - 1, Math.min(delay * 2, MAX_RETRY_DELAY));
-    }
-    throw error;
-  }
-}
-
-// Fonction pour analyser en profondeur un METAR
+// Fonction robuste pour analyser les METAR
 function parseMetarDetails(rawMetar) {
-  // (Le code reste le même)
+  try {
+    // Valeurs par défaut pour éviter les erreurs undefined
+    const result = {
+      ventDirection: null,
+      ventVariable: false,
+      ventVitesse: null,
+      ventRafales: null,
+      ventUnites: 'KT',
+      visibilite: null,
+      phenomenes: [],
+      nuages: [],
+      temperature: null,
+      pointRosee: null,
+      qnh: null
+    };
+    
+    if (!rawMetar) return result;
+    
+    // Diviser le METAR en parties
+    const parts = rawMetar.split(' ');
+    if (parts.length < 3) return result; // METAR trop court
+    
+    // Ignorer le code OACI et la date/heure
+    let i = 2;
+    
+    while (i < parts.length) {
+      const part = parts[i];
+      if (!part) { i++; continue; } // Ignorer les parties vides
+      
+      // Analyse du vent
+      if (/^(\d{3}|VRB)(\d{2,3})(G\d{2,3})?(KT|MPS)$/.test(part) || 
+          /^\/\/\/(\d{2,3})(G\d{2,3})?(KT|MPS)$/.test(part) || 
+          /^00000(KT|MPS)$/.test(part)) {
+        
+        try {
+          if (part.startsWith('VRB')) {
+            result.ventVariable = true;
+            const match = part.match(/VRB(\d{2,3})(G(\d{2,3}))?(KT|MPS)/);
+            if (match) {
+              result.ventVitesse = parseInt(match[1]);
+              if (match[3]) result.ventRafales = parseInt(match[3]);
+              result.ventUnites = match[4];
+            }
+          } else if (part.startsWith('///')) {
+            const match = part.match(/\/\/\/(\d{2,3})(G(\d{2,3}))?(KT|MPS)/);
+            if (match) {
+              result.ventVitesse = parseInt(match[1]);
+              if (match[3]) result.ventRafales = parseInt(match[3]);
+              result.ventUnites = match[4];
+            }
+          } else if (part === '00000KT' || part === '00000MPS') {
+            result.ventDirection = 0;
+            result.ventVitesse = 0;
+            result.ventUnites = part.endsWith('KT') ? 'KT' : 'MPS';
+          } else {
+            const match = part.match(/^(\d{3})(\d{2,3})(G(\d{2,3}))?(KT|MPS)$/);
+            if (match) {
+              result.ventDirection = parseInt(match[1]);
+              result.ventVitesse = parseInt(match[2]);
+              if (match[4]) result.ventRafales = parseInt(match[4]);
+              result.ventUnites = match[5];
+            }
+          }
+        } catch (e) {
+          console.log(`Erreur analyse vent: ${e.message}`);
+        }
+      }
+      // Analyse de la visibilité
+      else if (/^\d{4}$/.test(part) || part === '9999') {
+        try {
+          result.visibilite = parseInt(part);
+        } catch (e) { }
+      }
+      else if (part === 'CAVOK') {
+        result.visibilite = 9999;
+      }
+      // Analyse des nuages
+      else if (/^(FEW|SCT|BKN|OVC)(\d{3})(CB|TCU)?$/.test(part)) {
+        try {
+          const match = part.match(/^(FEW|SCT|BKN|OVC)(\d{3})(CB|TCU)?$/);
+          if (match) {
+            result.nuages.push({
+              type: match[1],
+              hauteur: parseInt(match[2]) * 100,
+              orage: match[3] === 'CB' || match[3] === 'TCU'
+            });
+          }
+        } catch (e) { }
+      }
+      // Température et point de rosée
+      else if (/^(M)?(\d{1,2})\/(M)?(\d{1,2})$/.test(part)) {
+        try {
+          const match = part.match(/^(M)?(\d{1,2})\/(M)?(\d{1,2})$/);
+          if (match) {
+            result.temperature = (match[1] ? -1 : 1) * parseInt(match[2]);
+            result.pointRosee = (match[3] ? -1 : 1) * parseInt(match[4]);
+          }
+        } catch (e) { }
+      }
+      // QNH
+      else if (/^Q\d{4}$/.test(part)) {
+        try {
+          result.qnh = parseInt(part.substring(1));
+        } catch (e) { }
+      }
+      
+      i++;
+    }
+    
+    return result;
+  } catch (error) {
+    console.error("Erreur analyse METAR:", error.message);
+    // Retourner un objet vide mais valide
+    return {
+      ventDirection: null,
+      ventVariable: false,
+      ventVitesse: null,
+      ventRafales: null,
+      ventUnites: null,
+      visibilite: null,
+      phenomenes: [],
+      nuages: [],
+      temperature: null,
+      pointRosee: null,
+      qnh: null
+    };
+  }
 }
 
-// Fonction pour mettre à jour un METAR avec retry
-async function updateMetar(icaoCode, isFirstBatch = false) {
-  const url = `https://tgftp.nws.noaa.gov/data/observations/metar/stations/${icaoCode}.TXT`;
-  
+// Fonction METAR complète mais robuste
+async function updateMetar(icaoCode) {
   try {
-    const response = await fetchWithRetry(url);
+    const url = `https://tgftp.nws.noaa.gov/data/observations/metar/stations/${icaoCode}.TXT`;
+    const response = await fetch(url);
+    
     if (!response.ok) return false;
     
     const text = await response.text();
@@ -71,58 +165,40 @@ async function updateMetar(icaoCode, isFirstBatch = false) {
     const rawMetar = lines[1].trim();
     const observationDate = new Date(dateStr);
     
-    // Analyser le METAR
+    // 1. D'abord juste sauvegarder les données brutes
+    const { error: rawError } = await supabase
+      .from('metars')
+      .upsert({
+        code_oaci: icaoCode,
+        raw_metar: rawMetar,
+        date_observation: observationDate.toISOString(),
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'code_oaci' });
+    
+    if (rawError) throw rawError;
+    
+    // 2. Ensuite faire l'analyse détaillée
     const parsedMetar = parseMetarDetails(rawMetar);
     
-    // Version simplifiée pour les premiers lots (pour éviter les timeouts)
-    let metarData;
-    
-    if (isFirstBatch) {
-      // Version simplifiée avec moins de données JSON complexes
-      metarData = {
-        code_oaci: icaoCode,
-        raw_metar: rawMetar,
-        date_observation: observationDate.toISOString(),
+    // 3. Mettre à jour avec l'analyse
+    const { error: updateError } = await supabase
+      .from('metars')
+      .update({
         vent_direction: parsedMetar.ventDirection,
         vent_variable: parsedMetar.ventVariable, 
         vent_vitesse: parsedMetar.ventVitesse,
         vent_rafales: parsedMetar.ventRafales,
         vent_unites: parsedMetar.ventUnites,
         visibilite: parsedMetar.visibilite,
+        phenomenes: parsedMetar.phenomenes.length > 0 ? parsedMetar.phenomenes : null,
+        nuages: parsedMetar.nuages.length > 0 ? parsedMetar.nuages : null,
         temperature: parsedMetar.temperature,
         point_rosee: parsedMetar.pointRosee,
-        qnh: parsedMetar.qnh,
-        updated_at: new Date().toISOString()
-      };
-    } else {
-      // Version complète avec toutes les données
-      metarData = {
-        code_oaci: icaoCode,
-        raw_metar: rawMetar,
-        date_observation: observationDate.toISOString(),
-        vent_direction: parsedMetar.ventDirection,
-        vent_variable: parsedMetar.ventVariable, 
-        vent_vitesse: parsedMetar.ventVitesse,
-        vent_rafales: parsedMetar.ventRafales,
-        vent_unites: parsedMetar.ventUnites,
-        visibilite: parsedMetar.visibilite,
-        phenomenes: parsedMetar.phenomenes,
-        nuages: parsedMetar.nuages,
-        temperature: parsedMetar.temperature,
-        point_rosee: parsedMetar.pointRosee,
-        qnh: parsedMetar.qnh,
-        updated_at: new Date().toISOString()
-      };
-    }
+        qnh: parsedMetar.qnh
+      })
+      .eq('code_oaci', icaoCode);
     
-    // Insérer dans Supabase avec retry
-    const { error } = await supabaseWithRetry(async () => {
-      return await supabase
-        .from('metars')
-        .upsert(metarData, { onConflict: 'code_oaci' });
-    });
-    
-    if (error) throw error;
+    if (updateError) throw updateError;
     
     return true;
   } catch (error) {
@@ -131,52 +207,152 @@ async function updateMetar(icaoCode, isFirstBatch = false) {
   }
 }
 
-// Fonction améliorée pour analyser les segments TAF
-async function parseTafSegments(tafData, icaoCode, isFirstBatch = false) {
+// Fonction pour analyser un TAF de manière robuste
+async function analyzeTafAndCreateSegments(tafData, icaoCode) {
   try {
-    const { raw_taf, validite_debut, validite_fin, id, date_emission } = tafData;
+    const { raw_taf, validite_debut, validite_fin, id } = tafData;
     
-    // Supprimer les segments existants pour ce TAF
-    await supabaseWithRetry(async () => {
-      return await supabase
+    // Supprimer les segments existants
+    try {
+      await supabase
         .from('taf_segments')
         .delete()
         .eq('taf_id', id);
-    });
-    
-    // Si c'est le premier lot, on ne fait qu'une analyse simple
-    if (isFirstBatch) {
-      // Insertion simple d'un seul segment basique
-      await supabaseWithRetry(async () => {
-        return await supabase
-          .from('taf_segments')
-          .insert({
-            taf_id: id,
-            code_oaci: icaoCode,
-            segment_type: 'INIT',
-            raw_segment: raw_taf,
-            valide_debut: validite_debut,
-            valide_fin: validite_fin
-          });
-      });
-      
-      return 1; // Un seul segment
+    } catch (deleteError) {
+      console.error(`Erreur suppression segments TAF ${icaoCode}:`, deleteError.message);
     }
     
-    // Le reste du code reste le même pour l'analyse complète
-    // ...
+    if (!raw_taf) return 0;
+    
+    // Expressions régulières pour les changements
+    const changeRegex = /\b(BECMG|TEMPO|FM\d{6}|PROB\d{2})\b/g;
+    
+    // Diviser le TAF en tokens
+    const tokens = raw_taf.split(' ');
+    
+    // Trouver les indices des tokens de changement
+    const changes = [];
+    let currentType = 'INIT';
+    let currentStart = 0;
+    
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.match(/^(BECMG|TEMPO)$/) || token.match(/^FM\d{6}$/) || token.match(/^PROB\d{2}$/)) {
+        // Enregistrer le segment précédent
+        changes.push({
+          type: currentType,
+          startIndex: currentStart,
+          endIndex: i - 1
+        });
+        
+        // Nouveau segment
+        currentType = token.match(/^PROB\d{2}$/) ? 'PROB' : token;
+        currentStart = i;
+      }
+    }
+    
+    // Ajouter le dernier segment
+    changes.push({
+      type: currentType,
+      startIndex: currentStart,
+      endIndex: tokens.length - 1
+    });
+    
+    // Traiter chaque segment
+    for (let i = 0; i < changes.length; i++) {
+      const segment = changes[i];
+      const segmentText = tokens.slice(segment.startIndex, segment.endIndex + 1).join(' ');
+      
+      // Extraire les données météo basiques du segment
+      let ventDirection = null;
+      let ventVariable = false;
+      let ventVitesse = null;
+      let ventRafales = null;
+      let ventUnites = 'KT';
+      let visibilite = null;
+      let probability = null;
+      
+      // Calculer la probabilité si c'est un segment PROB
+      if (segment.type === 'PROB' && tokens[segment.startIndex].match(/^PROB(\d{2})$/)) {
+        try {
+          probability = parseInt(tokens[segment.startIndex].substring(4));
+        } catch (e) {}
+      }
+      
+      // Extraire les infos météo
+      for (let j = segment.startIndex; j <= segment.endIndex; j++) {
+        const token = tokens[j];
+        
+        // Vent
+        if (/^(\d{3}|VRB)(\d{2,3})(G\d{2,3})?(KT|MPS)$/.test(token)) {
+          try {
+            if (token.startsWith('VRB')) {
+              ventVariable = true;
+              const match = token.match(/VRB(\d{2,3})(G(\d{2,3}))?(KT|MPS)/);
+              if (match) {
+                ventVitesse = parseInt(match[1]);
+                if (match[3]) ventRafales = parseInt(match[3]);
+                ventUnites = match[4];
+              }
+            } else {
+              const match = token.match(/^(\d{3})(\d{2,3})(G(\d{2,3}))?(KT|MPS)$/);
+              if (match) {
+                ventDirection = parseInt(match[1]);
+                ventVitesse = parseInt(match[2]);
+                if (match[4]) ventRafales = parseInt(match[4]);
+                ventUnites = match[5];
+              }
+            }
+          } catch (e) {}
+        }
+        
+        // Visibilité
+        if (/^\d{4}$/.test(token)) {
+          try {
+            visibilite = parseInt(token);
+          } catch (e) {}
+        }
+        
+        if (token === 'CAVOK' || token === '9999') {
+          visibilite = 9999;
+        }
+      }
+      
+      // Insérer le segment
+      try {
+        await supabase.from('taf_segments').insert({
+          taf_id: id,
+          code_oaci: icaoCode,
+          segment_type: segment.type,
+          probability: probability,
+          valide_debut: validite_debut,
+          valide_fin: validite_fin,
+          raw_segment: segmentText,
+          vent_direction: ventDirection,
+          vent_variable: ventVariable,
+          vent_vitesse: ventVitesse,
+          vent_rafales: ventRafales,
+          vent_unites: ventUnites,
+          visibilite: visibilite
+        });
+      } catch (insertError) {
+        console.error(`Erreur insertion segment TAF ${icaoCode}:`, insertError.message);
+      }
+    }
+    
+    return changes.length;
   } catch (error) {
-    console.error(`Erreur lors de l'analyse des segments TAF pour ${icaoCode}:`, error.message);
+    console.error(`Erreur analyse TAF ${icaoCode}:`, error.message);
     return 0;
   }
 }
 
-// Fonction pour mettre à jour le TAF avec retry
-async function updateTaf(icaoCode, isFirstBatch = false) {
-  const url = `https://tgftp.nws.noaa.gov/data/forecasts/taf/stations/${icaoCode}.TXT`;
-  
+// Fonction TAF complète en approche séquentielle
+async function updateTaf(icaoCode) {
   try {
-    const response = await fetchWithRetry(url);
+    const url = `https://tgftp.nws.noaa.gov/data/forecasts/taf/stations/${icaoCode}.TXT`;
+    const response = await fetch(url);
+    
     if (!response.ok) return false;
     
     const text = await response.text();
@@ -188,58 +364,53 @@ async function updateTaf(icaoCode, isFirstBatch = false) {
     const rawTaf = lines.slice(1).join(' ').trim();
     const emissionDate = new Date(dateStr);
     
-    // Extraire la période de validité (format: 0212/0318)
-    const validityPattern = /\b(\d{2})(\d{2})\/(\d{2})(\d{2})\b/;
-    const validityMatch = rawTaf.match(validityPattern);
+    // Extraire la période de validité
     let validiteDebut = null;
     let validiteFin = null;
     
+    const validityMatch = rawTaf.match(/\b(\d{2})(\d{2})\/(\d{2})(\d{2})\b/);
     if (validityMatch) {
+      const now = new Date();
+      const year = now.getUTCFullYear();
+      const month = now.getUTCMonth();
+      
       const day1 = parseInt(validityMatch[1]);
       const hour1 = parseInt(validityMatch[2]);
       const day2 = parseInt(validityMatch[3]);
       const hour2 = parseInt(validityMatch[4]);
       
-      // Calculer les dates complètes
-      const now = new Date();
-      const month = now.getUTCMonth();
-      const year = now.getUTCFullYear();
-      
       validiteDebut = new Date(Date.UTC(year, month, day1, hour1, 0, 0));
       validiteFin = new Date(Date.UTC(year, month, day2, hour2, 0, 0));
       
-      // Ajuster si la fin est avant le début (passage de mois)
       if (validiteFin < validiteDebut) {
         validiteFin.setUTCMonth(validiteFin.getUTCMonth() + 1);
       }
     }
     
-    // Insérer/mettre à jour le TAF principal avec retry
-    const { data, error } = await supabaseWithRetry(async () => {
-      return await supabase
-        .from('tafs')
-        .upsert({
-          code_oaci: icaoCode,
-          raw_taf: rawTaf,
-          date_emission: emissionDate.toISOString(),
-          validite_debut: validiteDebut ? validiteDebut.toISOString() : null,
-          validite_fin: validiteFin ? validiteFin.toISOString() : null,
-          updated_at: new Date().toISOString()
-        }, { 
-          onConflict: 'code_oaci',
-          returning: 'representation'
-        });
-    });
+    // 1. D'abord sauvegarder le TAF brut
+    const { data, error } = await supabase
+      .from('tafs')
+      .upsert({
+        code_oaci: icaoCode,
+        raw_taf: rawTaf,
+        date_emission: emissionDate.toISOString(),
+        validite_debut: validiteDebut ? validiteDebut.toISOString() : null,
+        validite_fin: validiteFin ? validiteFin.toISOString() : null,
+        updated_at: new Date().toISOString()
+      }, { 
+        onConflict: 'code_oaci',
+        returning: 'representation'
+      });
     
     if (error) throw error;
     
-    // Analyser et insérer les segments du TAF
+    // 2. Ensuite analyser les segments si possible
     if (data && data.length > 0) {
+      // Pause brève avant d'analyser les segments
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
       const tafData = data[0];
-      const segmentsCount = await parseTafSegments(tafData, icaoCode, isFirstBatch);
-      if (!isFirstBatch) {
-        console.log(`TAF pour ${icaoCode} découpé en ${segmentsCount} segments`);
-      }
+      const segmentsCount = await analyzeTafAndCreateSegments(tafData, icaoCode);
     }
     
     return true;
@@ -249,7 +420,7 @@ async function updateTaf(icaoCode, isFirstBatch = false) {
   }
 }
 
-// Fonction principale avec traitement adaptatif
+// Fonction principale avec approche séquentielle
 async function updateMeteoData() {
   console.log("Début de la mise à jour des données météo");
   const startTime = new Date();
@@ -265,100 +436,69 @@ async function updateMeteoData() {
     const validAerodromes = aerodromes.filter(a => a.code_oaci && a.code_oaci.length === 4);
     console.log(`Trouvé ${validAerodromes.length} aérodromes valides sur ${aerodromes.length} total`);
     
-    // Statistiques globales
+    // Statistiques
     let metarSuccess = 0;
     let tafSuccess = 0;
     let processed = 0;
-    let errors = 0;
     
-    // Traitement spécial du premier lot pour "préchauffer" la connexion
-    const firstBatchSize = Math.min(INITIAL_BATCH_SIZE, validAerodromes.length);
-    if (firstBatchSize > 0) {
-      console.log(`Traitement du lot d'initialisation (${firstBatchSize} aérodromes)`);
-      const firstBatch = validAerodromes.slice(0, firstBatchSize);
-      
-      // Traiter les aérodromes un par un avec un petit délai entre chaque
-      for (const aerodrome of firstBatch) {
-        const icaoCode = aerodrome.code_oaci;
-        try {
-          await updateMetar(icaoCode, true);
-          await updateTaf(icaoCode, true);
-          // Pause entre chaque aérodrome
-          await new Promise(resolve => setTimeout(resolve, 500));
-        } catch (e) {
-          console.error(`Erreur d'initialisation pour ${icaoCode}:`, e.message);
-        }
-      }
-      
-      console.log(`Lot d'initialisation terminé, passage au traitement principal`);
-      processed += firstBatchSize;
-    }
-    
-    // Traitement des lots restants en parallèle
-    const remainingAerodromes = validAerodromes.slice(firstBatchSize);
-    for (let i = 0; i < remainingAerodromes.length; i += CONCURRENT_BATCH_SIZE) {
+    // Traiter les aérodromes par petits lots séquentiels
+    for (let i = 0; i < validAerodromes.length; i += BATCH_SIZE) {
       const batchStartTime = new Date();
       
-      // Prendre un lot d'aérodromes
-      const batch = remainingAerodromes.slice(i, i + CONCURRENT_BATCH_SIZE);
-      const batchNumber = Math.floor(i/CONCURRENT_BATCH_SIZE) + 1;
-      const totalBatches = Math.ceil(remainingAerodromes.length/CONCURRENT_BATCH_SIZE);
+      const batch = validAerodromes.slice(i, i + BATCH_SIZE);
+      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(validAerodromes.length / BATCH_SIZE);
+      
       console.log(`Traitement du lot ${batchNumber}/${totalBatches} (${batch.length} aérodromes)`);
       
-      // Traiter tous les aérodromes du lot en parallèle
-      const results = await Promise.all(
-        batch.map(async (aerodrome) => {
-          const icaoCode = aerodrome.code_oaci;
-          let result = { icaoCode, metarSuccess: false, tafSuccess: false, error: null };
+      // Traitement séquentiel à l'intérieur du lot
+      for (const aerodrome of batch) {
+        const icaoCode = aerodrome.code_oaci;
+        
+        try {
+          // METAR
+          const metarResult = await updateMetar(icaoCode);
+          if (metarResult) metarSuccess++;
           
-          try {
-            // Récupérer et mettre à jour METAR et TAF en parallèle
-            const [metarResult, tafResult] = await Promise.all([
-              updateMetar(icaoCode),
-              updateTaf(icaoCode)
-            ]);
-            
-            result.metarSuccess = metarResult;
-            result.tafSuccess = tafResult;
-          } catch (error) {
-            result.error = error.message;
-            console.error(`Erreur pour ${icaoCode}:`, error.message);
-          }
+          // Pause entre METAR et TAF
+          await new Promise(resolve => setTimeout(resolve, 100));
           
-          return result;
-        })
-      );
+          // TAF
+          const tafResult = await updateTaf(icaoCode);
+          if (tafResult) tafSuccess++;
+          
+          processed++;
+        } catch (error) {
+          console.error(`Erreur pour ${icaoCode}:`, error.message);
+        }
+        
+        // Pause entre chaque aérodrome
+        await new Promise(resolve => setTimeout(resolve, PAUSE_BETWEEN_AERODROMES));
+      }
       
-      // Calculer les statistiques pour ce lot
-      const batchResults = results.reduce((stats, result) => {
-        if (result.metarSuccess) stats.metarSuccess++;
-        if (result.tafSuccess) stats.tafSuccess++;
-        if (result.error) stats.errors++;
-        stats.processed++;
-        return stats;
-      }, { metarSuccess: 0, tafSuccess: 0, processed: 0, errors: 0 });
-      
-      // Mettre à jour les statistiques globales
-      metarSuccess += batchResults.metarSuccess;
-      tafSuccess += batchResults.tafSuccess;
-      processed += batchResults.processed;
-      errors += batchResults.errors;
-      
-      // Afficher la progression et le temps
+      // Statistiques du lot
       const batchEndTime = new Date();
       const batchDuration = (batchEndTime - batchStartTime) / 1000;
+      
       console.log(`Lot terminé en ${batchDuration.toFixed(2)}s - Progression: ${processed}/${validAerodromes.length} aérodromes traités`);
-      console.log(`METAR: ${batchResults.metarSuccess}/${batch.length} succès, TAF: ${batchResults.tafSuccess}/${batch.length} succès, Erreurs: ${batchResults.errors}`);
+      console.log(`METAR: ${metarSuccess}, TAF: ${tafSuccess}`);
+      
+      // Pause entre les lots
+      if (i + BATCH_SIZE < validAerodromes.length) {
+        console.log(`Pause avant le prochain lot...`);
+        await new Promise(resolve => setTimeout(resolve, PAUSE_BETWEEN_LOTS));
+      }
     }
     
     // Statistiques finales
     const endTime = new Date();
     const totalDuration = (endTime - startTime) / 1000;
+    
     console.log("========= RÉCAPITULATIF =========");
     console.log(`Terminé en ${totalDuration.toFixed(2)} secondes`);
-    console.log(`Total: ${processed} aérodromes traités (${errors} avec erreurs)`);
-    console.log(`METAR: ${metarSuccess}/${validAerodromes.length - firstBatchSize} mis à jour (${((metarSuccess/(validAerodromes.length - firstBatchSize))*100).toFixed(1)}%)`);
-    console.log(`TAF: ${tafSuccess}/${validAerodromes.length - firstBatchSize} mis à jour (${((tafSuccess/(validAerodromes.length - firstBatchSize))*100).toFixed(1)}%)`);
+    console.log(`Total: ${processed}/${validAerodromes.length} aérodromes traités`);
+    console.log(`METAR: ${metarSuccess}/${validAerodromes.length} mis à jour (${((metarSuccess/validAerodromes.length)*100).toFixed(1)}%)`);
+    console.log(`TAF: ${tafSuccess}/${validAerodromes.length} mis à jour (${((tafSuccess/validAerodromes.length)*100).toFixed(1)}%)`);
     console.log("=================================");
     
   } catch (error) {
